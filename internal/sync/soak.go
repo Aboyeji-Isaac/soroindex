@@ -18,6 +18,7 @@ package sync
 // would compare two different processes' startup states.
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +32,7 @@ import (
 	"time"
 
 	"github.com/Soroban-CII/soroindex/internal/config"
+	"github.com/Soroban-CII/soroindex/internal/store"
 )
 
 // Soak defaults. DefaultSoakDuration is 30 minutes so that the nightly
@@ -76,6 +78,49 @@ const (
 // a single sentinel so a caller can tell a threshold failure from an RPC or
 // database failure without reading messages.
 var ErrSoakThreshold = errors.New("soak threshold violated")
+
+// SoakDatabaseState is the durable position that a segment resumes. The
+// checkpoint must name the same ledger as last_ledger; its hash is what Loop
+// compares with testnet before the first write in a resumed segment.
+type SoakDatabaseState struct {
+	LastLedger uint32
+	Checkpoint store.Checkpoint
+}
+
+// CheckSoakDatabase verifies SQLite's own consistency check and the sync
+// position invariant needed to carry an index between soak segments. A new
+// database has neither last_ledger nor a checkpoint and returns the zero state.
+func CheckSoakDatabase(ctx context.Context, s *store.Store) (SoakDatabaseState, error) {
+	var integrity string
+	if err := s.DB.QueryRowContext(ctx, `PRAGMA integrity_check`).Scan(&integrity); err != nil {
+		return SoakDatabaseState{}, fmt.Errorf("soak database integrity check: %w", err)
+	}
+	if integrity != "ok" {
+		return SoakDatabaseState{}, fmt.Errorf("soak database integrity check: %s", integrity)
+	}
+	lastText, err := s.State(ctx, store.KeyLastLedger)
+	if errors.Is(err, store.ErrNotFound) {
+		if _, checkpointErr := s.Checkpoint(ctx); !errors.Is(checkpointErr, store.ErrNotFound) {
+			return SoakDatabaseState{}, fmt.Errorf("soak database has a checkpoint without last_ledger: %v", checkpointErr)
+		}
+		return SoakDatabaseState{}, nil
+	}
+	if err != nil {
+		return SoakDatabaseState{}, fmt.Errorf("soak database last_ledger: %w", err)
+	}
+	last, err := strconv.ParseUint(lastText, 10, 32)
+	if err != nil || last == 0 {
+		return SoakDatabaseState{}, fmt.Errorf("soak database last_ledger %q is invalid", lastText)
+	}
+	checkpoint, err := s.Checkpoint(ctx)
+	if err != nil {
+		return SoakDatabaseState{}, fmt.Errorf("soak database checkpoint: %w", err)
+	}
+	if checkpoint.Ledger != uint32(last) {
+		return SoakDatabaseState{}, fmt.Errorf("soak database checkpoint ledger %d differs from last_ledger %d", checkpoint.Ledger, last)
+	}
+	return SoakDatabaseState{LastLedger: uint32(last), Checkpoint: checkpoint}, nil
+}
 
 // SoakConfig holds the duration and thresholds of one soak segment. The
 // zero value is not usable; ParseSoakConfig fills the defaults.

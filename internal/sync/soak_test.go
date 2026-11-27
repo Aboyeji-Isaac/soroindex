@@ -294,6 +294,71 @@ func TestReadSoakMemoryReportsSomething(t *testing.T) {
 	t.Logf("rss=%d heap=%d", m.RSSBytes, m.HeapBytes)
 }
 
+func TestSoakActionUsesWorkspaceAbsoluteArtifactPaths(t *testing.T) {
+	path := filepath.Join("..", "..", ".github", "actions", "soak-segment", "action.yml")
+	b, err := os.ReadFile(path) // #nosec G304 -- fixed repository test fixture
+	if err != nil {
+		t.Fatal(err)
+	}
+	action := string(b)
+	for _, want := range []string{
+		`workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"`,
+		`SEP47IDX_SOAK_SAMPLE_DIR: ${{ steps.paths.outputs.sample_dir }}`,
+		`SEP47IDX_SOAK_DB: ${{ steps.paths.outputs.db }}`,
+		`SEP47IDX_SOAK_REPORT: ${{ steps.paths.outputs.report }}`,
+		`for artifact in "$SOAK_DB" "$SOAK_SAMPLES" "$SOAK_REPORT" "$SOAK_LOG"`,
+	} {
+		if !strings.Contains(action, want) {
+			t.Errorf("soak action does not contain %q", want)
+		}
+	}
+	for _, relative := range []string{
+		"SEP47IDX_SOAK_SAMPLE_DIR: soak/",
+		"SEP47IDX_SOAK_DB: soak/",
+		"SEP47IDX_SOAK_REPORT: soak/",
+	} {
+		if strings.Contains(action, relative) {
+			t.Errorf("soak action still contains package-relative path %q", relative)
+		}
+	}
+	if got := strings.Count(action, "if-no-files-found: error"); got != 2 {
+		t.Errorf("mandatory artifact uploads using if-no-files-found: error = %d, want 2", got)
+	}
+}
+
+func TestCheckSoakDatabaseRequiresCheckpointContinuity(t *testing.T) {
+	ctx := context.Background()
+	s := testStore(t)
+	state, err := CheckSoakDatabase(ctx, s)
+	if err != nil || state.LastLedger != 0 {
+		t.Fatalf("new database state = %+v, %v", state, err)
+	}
+	tx, err := s.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := store.Checkpoint{Ledger: 42, Hash: strings.Repeat("ab", 32)}
+	if err := tx.SetLastLedger(ctx, checkpoint.Ledger); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.SetCheckpoint(ctx, checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	state, err = CheckSoakDatabase(ctx, s)
+	if err != nil || state.LastLedger != checkpoint.Ledger || state.Checkpoint != checkpoint {
+		t.Fatalf("resumable database state = %+v, %v; want %+v", state, err, checkpoint)
+	}
+	if err := s.SetState(ctx, store.KeyLastLedger, "43"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CheckSoakDatabase(ctx, s); err == nil || !strings.Contains(err.Error(), "differs from last_ledger 43") {
+		t.Fatalf("mismatched checkpoint error = %v", err)
+	}
+}
+
 // soakSeries builds samples for one segment with the given memory values.
 func soakSeries(segment int, start time.Time, lags []uint32, mem []uint64, caughtUp bool) []SoakSample {
 	out := make([]SoakSample, 0, len(mem))

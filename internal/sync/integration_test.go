@@ -73,10 +73,19 @@ func TestFollowTestnet30Minutes(t *testing.T) {
 	// segment names a database carried over from the previous segment and
 	// resumes it from its stored last_ledger.
 	dbPath := cfg.DBPath
+	resuming := false
 	if dbPath == "" {
 		dbPath = filepath.Join(t.TempDir(), "follow.db")
 	} else if dir := filepath.Dir(dbPath); dir != "" {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if info, err := os.Stat(dbPath); err == nil {
+			if info.Size() == 0 {
+				t.Fatalf("resume database %s is empty", dbPath)
+			}
+			resuming = true
+		} else if !errors.Is(err, os.ErrNotExist) {
 			t.Fatal(err)
 		}
 	}
@@ -86,6 +95,16 @@ func TestFollowTestnet30Minutes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = s.Close() }()
+	initialState, err := CheckSoakDatabase(ctx, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resuming {
+		if initialState.LastLedger == 0 {
+			t.Fatal("resume database has no durable sync position")
+		}
+		t.Logf("resuming last_ledger %d from checkpoint %s", initialState.LastLedger, initialState.Checkpoint)
+	}
 	sampler, err := NewSoakSampler(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -113,6 +132,16 @@ func TestFollowTestnet30Minutes(t *testing.T) {
 	latest, latestErr := client.GetLatestLedger(ctx)
 	if stateErr == nil && latestErr == nil {
 		sampler.Record(uint32(last), latest.Sequence, true)
+	}
+	finalState, databaseErr := CheckSoakDatabase(ctx, s)
+	if databaseErr != nil {
+		t.Errorf("final database: %v", databaseErr)
+	} else if finalState.LastLedger != uint32(last) {
+		t.Errorf("final checkpoint ledger %d differs from observed last_ledger %d", finalState.LastLedger, last)
+	} else if resuming && finalState.LastLedger <= initialState.LastLedger {
+		t.Errorf("resume did not advance: started at %d, finished at %d", initialState.LastLedger, finalState.LastLedger)
+	} else {
+		t.Logf("database integrity ok; checkpoint %s", finalState.Checkpoint)
 	}
 	if err := sampler.Close(); err != nil {
 		t.Errorf("sample log: %v", err)
